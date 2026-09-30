@@ -1,7 +1,10 @@
 import { create } from 'zustand'
-import type { Comment, EditConflict, Paragraph, Reply, Role, Version } from '../types'
+import { resolveConflictOnServer, resetMockServer, setMockFailRandom, setNetworkOnline as setMockNetwork, syncItems } from '../services/mockApi'
+import type { SyncResult } from '../services/mockApi'
+import type { ArchivedVersion, Comment, EditConflict, Paragraph, QueueItem, Reply, Role, Version } from '../types'
 
 const DRAFT_KEY = 'sologsb-1002-draft-v1'
+const QUEUE_KEY = 'sologsb-1002-queue-v1'
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
 const baseParagraphs: Paragraph[] = [
@@ -21,19 +24,44 @@ const baseComments: Comment[] = [
   { id: 'c-05', paragraphId: 'p-05', author: '审稿人 D', role: 'reviewer', type: 'comment', quote: '邀请第三位研究者裁决', body: '与上一段重复：都在说明编码分歧如何解决，建议合并意见。', status: 'open', replies: [], createdAt: Date.now() - 43000000 },
   { id: 'c-06', paragraphId: 'p-06', author: '审稿人 B', role: 'reviewer', type: 'suggestion', quote: '但没有显著降低维护者处理复杂议题的认知负担', body: '“显著”需要给出统计检验与效应量。', suggestion: '初步结果显示，辅助工具缩短了首次响应时间，但对复杂议题处理时长与自我报告认知负担均未产生统计显著影响。', status: 'open', replies: [], createdAt: Date.now() - 36000000 },
 ]
-const seed = typeof localStorage !== 'undefined' ? localStorage.getItem(DRAFT_KEY) : null
-const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }> : null
-const initialParagraphs = parsed?.paragraphs?.length ? parsed.paragraphs : baseParagraphs
-const initialComments = parsed?.comments ?? baseComments
-const initialVersions: Version[] = parsed?.versions ?? [
+
+const readJSON = <T,>(key: string): T | null => {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) as T : null
+  } catch {
+    return null
+  }
+}
+
+const seed = readJSON<Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }>>(DRAFT_KEY)
+const initialParagraphs = seed?.paragraphs?.length ? seed.paragraphs : baseParagraphs
+const initialComments = seed?.comments ?? baseComments
+const initialVersions: Version[] = seed?.versions ?? [
   { id: 'v-01', label: '投稿初稿 v1', createdAt: Date.now() - 1209600000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs)) as Paragraph[] },
   { id: 'v-02', label: '审阅基线 v2', createdAt: Date.now() - 172800000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs.map((p) => p.id === 'p-04' ? { ...p, text: `${p.text} 编码规则在预注册方案中说明。` } : p))) as Paragraph[] },
 ]
 
+const queueSeed = readJSON<{ queue?: QueueItem[]; archives?: ArchivedVersion[] }>(QUEUE_KEY)
+const initialQueue: QueueItem[] = Array.isArray(queueSeed?.queue) ? (queueSeed?.queue as QueueItem[]) : []
+const initialArchives: ArchivedVersion[] = Array.isArray(queueSeed?.archives) ? (queueSeed?.archives as ArchivedVersion[]) : []
+
 const persistDraft = (paragraphs: Paragraph[], comments: Comment[], versions: Version[]) => {
   localStorage.setItem(DRAFT_KEY, JSON.stringify({ paragraphs, comments, versions }))
 }
+const persistQueue = (queue: QueueItem[], archives: ArchivedVersion[]) => {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify({ queue, archives }))
+}
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+/** 同步结果汇总，供界面提示 */
+export interface SyncSummary {
+  accepted: number
+  conflict: number
+  rejected: number
+  failed: number
+}
 
 interface ReviewState {
   role: Role
@@ -45,6 +73,11 @@ interface ReviewState {
   revisionMode: boolean
   dirty: boolean
   conflicts: EditConflict[]
+  queue: QueueItem[]
+  archives: ArchivedVersion[]
+  networkOnline: boolean
+  syncing: boolean
+  failRandom: boolean
   past: { paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }[]
   future: { paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }[]
   setRole: (role: Role) => void
@@ -61,6 +94,18 @@ interface ReviewState {
   addConflict: (conflict: EditConflict) => void
   resolveConflict: (conflictId: string, strategy: 'local' | 'remote') => void
   dismissConflict: (conflictId: string) => void
+  locateConflict: (conflictId: string) => void
+  enqueueParagraphEdit: (paragraphId: string, baseText: string, localText: string) => void
+  enqueueComment: (localId: string, input: Pick<Comment, 'paragraphId' | 'type' | 'quote' | 'body' | 'suggestion'>) => void
+  enqueueReply: (replyId: string, commentId: string, paragraphId: string, body: string) => void
+  setNetworkOnline: (online: boolean) => void
+  setFailRandom: (value: boolean) => void
+  syncQueue: () => Promise<SyncSummary | undefined>
+  retryQueueItem: (itemId: string) => Promise<void>
+  rebaseQueueItem: (itemId: string) => Promise<void>
+  discardQueueItem: (itemId: string) => void
+  clearSucceeded: () => void
+  restoreArchive: (archiveId: string) => void
   undo: () => void
   redo: () => void
   save: () => void
@@ -78,6 +123,8 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     return { ...next, past: [...state.past.slice(-49), history], future: [], dirty: true }
   })
 
+  const authorLabel = () => get().role === 'reviewer' ? '审稿人 A' : get().role === 'author' ? '作者' : '编辑'
+
   return {
     role: 'reviewer',
     paragraphs: initialParagraphs,
@@ -88,43 +135,74 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     revisionMode: false,
     dirty: false,
     conflicts: [],
+    queue: initialQueue,
+    archives: initialArchives,
+    networkOnline: true,
+    syncing: false,
+    failRandom: false,
     past: [],
     future: [],
     setRole: (role) => set({ role, selectedParagraphId: get().paragraphs[0]?.id ?? '' }),
     selectParagraph: (selectedParagraphId) => set({ selectedParagraphId }),
     setCommentFilter: (commentFilter) => set({ commentFilter }),
     setRevisionMode: (revisionMode) => set({ revisionMode }),
-    updateParagraph: (paragraphId, text) => record((state) => ({
-      paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
-        ? { ...paragraph, text, status: 'open' as const, highlighted: true }
-        : paragraph),
-    })),
-    addComment: (input) => record((state) => ({
-      comments: [{
-        ...input,
-        id: id('comment'),
-        author: state.role === 'reviewer' ? '审稿人 A' : state.role === 'author' ? '作者' : '编辑',
-        role: state.role,
-        status: 'open',
-        replies: [],
-        createdAt: Date.now(),
-      }, ...state.comments],
-    })),
-    replyComment: (commentId, body) => record((state) => ({
-      comments: state.comments.map((comment) => comment.id === commentId ? {
-        ...comment,
-        replies: [...comment.replies, { id: id('reply'), author: state.role === 'author' ? '作者' : state.role === 'reviewer' ? '审稿人 A' : '编辑', role: state.role, body, createdAt: Date.now() } as Reply],
-      } : comment),
-    })),
-    resolveSuggestion: (commentId, accepted) => record((state) => {
-      const comment = state.comments.find((item) => item.id === commentId)
-      return {
-        comments: state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item),
-        paragraphs: comment?.suggestion && accepted
-          ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' } : paragraph)
-          : state.paragraphs,
+    updateParagraph: (paragraphId, text) => {
+      // 基准文本在落本地前取定，作为三段对账的 base
+      const baseText = get().paragraphs.find((paragraph) => paragraph.id === paragraphId)?.text ?? text
+      record((state) => ({
+        paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
+          ? { ...paragraph, text, status: 'open' as const, highlighted: true }
+          : paragraph),
+      }))
+      get().enqueueParagraphEdit(paragraphId, baseText, text)
+    },
+    addComment: (input) => {
+      const localId = id('comment')
+      record((state) => ({
+        comments: [{
+          ...input,
+          id: localId,
+          author: authorLabel(),
+          role: state.role,
+          status: 'open',
+          replies: [],
+          createdAt: Date.now(),
+        }, ...state.comments],
+      }))
+      get().enqueueComment(localId, input)
+    },
+    replyComment: (commentId, body) => {
+      const replyId = id('reply')
+      const paragraphId = get().comments.find((comment) => comment.id === commentId)?.paragraphId ?? ''
+      record((state) => ({
+        comments: state.comments.map((comment) => comment.id === commentId ? {
+          ...comment,
+          replies: [...comment.replies, { id: replyId, author: authorLabel(), role: state.role, body, createdAt: Date.now() } as Reply],
+        } : comment),
+      }))
+      get().enqueueReply(replyId, commentId, paragraphId, body)
+    },
+    resolveSuggestion: (commentId, accepted) => {
+      const comment = get().comments.find((item) => item.id === commentId)
+      const target = comment?.suggestion && accepted ? get().paragraphs.find((paragraph) => paragraph.id === comment.paragraphId) : undefined
+      const baseText = target?.text
+      record((state) => {
+        const suggestion = state.comments.find((item) => item.id === commentId)
+        const paragraph = suggestion?.suggestion && accepted
+          ? state.paragraphs.find((item) => item.id === suggestion.paragraphId)
+          : undefined
+        return {
+          comments: state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item),
+          paragraphs: paragraph && suggestion
+            ? state.paragraphs.map((item) => item.id === suggestion.paragraphId ? { ...item, text: suggestion.suggestion as string, status: 'accepted' } : item)
+            : state.paragraphs,
+        }
+      })
+      // 接受建议会改正文，同样进入待提交队列与远端对账
+      if (target && baseText !== undefined && comment?.suggestion) {
+        get().enqueueParagraphEdit(target.id, baseText, comment.suggestion)
       }
-    }),
+    },
     mergeComment: (commentId, targetId) => record((state) => ({
       comments: state.comments.map((comment) => comment.id === commentId ? { ...comment, status: 'merged', mergedInto: targetId } : comment),
     })),
@@ -138,16 +216,241 @@ export const useReviewStore = create<ReviewState>((set, get) => {
       versions: [{ id: id('version'), label: label.trim() || `版本 ${state.versions.length + 1}`, createdAt: Date.now(), paragraphs: clone(state.paragraphs) }, ...state.versions],
     })),
     addConflict: (conflict) => set((state) => ({ conflicts: [conflict, ...state.conflicts] })),
-    resolveConflict: (conflictId, strategy) => record((state) => {
-      const conflict = state.conflicts.find((item) => item.id === conflictId)
-      return {
-        paragraphs: conflict && strategy === 'remote'
-          ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
+    resolveConflict: (conflictId, strategy) => {
+      const conflict = get().conflicts.find((item) => item.id === conflictId)
+      if (!conflict) return
+      record((state) => ({
+        paragraphs: strategy === 'remote'
+          ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true, status: 'open' as const } : paragraph)
           : state.paragraphs,
         conflicts: state.conflicts.filter((item) => item.id !== conflictId),
+      }))
+      // 落选版本存入存档，可随时找回；队列条目标记对账成功
+      set((state) => ({
+        archives: [...state.archives, {
+          id: id('archive'),
+          paragraphId: conflict.paragraphId,
+          text: strategy === 'remote' ? conflict.localText : conflict.remoteText,
+          source: strategy === 'remote' ? 'local' as const : 'remote' as const,
+          reason: strategy === 'remote' ? 'conflict-local' as const : 'conflict-remote' as const,
+          conflictId: conflict.id,
+          archivedAt: Date.now(),
+        }],
+        queue: state.queue.map((item) => item.id === conflict.clientItemId
+          ? { ...item, status: 'succeeded' as const, lastError: undefined, rejectReason: undefined }
+          : item),
+      }))
+      void resolveConflictOnServer(conflict.paragraphId, strategy, strategy === 'local' ? conflict.localText : undefined)
+    },
+    dismissConflict: (conflictId) => set((state) => ({ conflicts: state.conflicts.map((conflict) => conflict.id === conflictId ? { ...conflict, dismissed: true } : conflict) })),
+    locateConflict: (conflictId) => set((state) => ({ conflicts: state.conflicts.map((conflict) => conflict.id === conflictId ? { ...conflict, dismissed: false } : conflict) })),
+    enqueueParagraphEdit: (paragraphId, baseText, localText) => set((state) => {
+      // 同一段落的待提交/失败/退回条目合并成一条，避免重复提交
+      const existing = state.queue.find((item) => item.kind === 'paragraph' && item.paragraphId === paragraphId && ['pending', 'failed', 'rejected'].includes(item.status))
+      if (existing) {
+        // 被退回后重新编辑：以当前文本为基准重基；若改回基准文本则撤下条目
+        const rebasedBase = existing.status === 'pending' ? existing.payload.baseText : state.paragraphs.find((paragraph) => paragraph.id === paragraphId)?.text
+        if (localText === rebasedBase) return { queue: state.queue.filter((item) => item.id !== existing.id) }
+        return {
+          queue: state.queue.map((item) => item.id === existing.id ? {
+            ...item,
+            status: 'pending' as const,
+            lastError: undefined,
+            rejectReason: undefined,
+            payload: { ...item.payload, baseText: rebasedBase, localText },
+          } : item),
+        }
+      }
+      if (localText === baseText) return {}
+      return {
+        queue: [...state.queue, {
+          id: id('queue'),
+          kind: 'paragraph' as const,
+          status: 'pending' as const,
+          paragraphId,
+          createdAt: Date.now(),
+          attempts: 0,
+          payload: { baseText, localText, author: authorLabel(), role: state.role },
+        }],
       }
     }),
-    dismissConflict: (conflictId) => set((state) => ({ conflicts: state.conflicts.filter((item) => item.id !== conflictId) })),
+    enqueueComment: (localId, input) => set((state) => ({
+      queue: [...state.queue, {
+        id: id('queue'),
+        kind: 'comment' as const,
+        status: 'pending' as const,
+        paragraphId: input.paragraphId,
+        createdAt: Date.now(),
+        attempts: 0,
+        payload: {
+          localId,
+          commentType: input.type,
+          quote: input.quote,
+          body: input.body,
+          suggestion: input.suggestion,
+          author: authorLabel(),
+          role: state.role,
+        },
+      }],
+      comments: state.comments.map((comment) => comment.id === localId ? { ...comment, syncStatus: 'pending' as const } : comment),
+    })),
+    enqueueReply: (replyId, commentId, paragraphId, body) => set((state) => ({
+      queue: [...state.queue, {
+        id: id('queue'),
+        kind: 'reply' as const,
+        status: 'pending' as const,
+        paragraphId,
+        createdAt: Date.now(),
+        attempts: 0,
+        payload: { replyId, commentId, paragraphId, body, author: authorLabel(), role: state.role },
+      }],
+      comments: state.comments.map((comment) => comment.id === commentId ? {
+        ...comment,
+        replies: comment.replies.map((reply) => reply.id === replyId ? { ...reply, syncStatus: 'pending' as const } : reply),
+      } : comment),
+    })),
+    setNetworkOnline: (online) => {
+      set({ networkOnline: online })
+      setMockNetwork(online)
+      if (online && get().queue.some((item) => item.status === 'pending' || item.status === 'failed')) void get().syncQueue()
+    },
+    setFailRandom: (value) => {
+      set({ failRandom: value })
+      setMockFailRandom(value)
+    },
+    syncQueue: async () => {
+      const state = get()
+      if (state.syncing) return undefined
+      const items = state.queue.filter((item) => item.status === 'pending' || item.status === 'failed')
+      if (!items.length) return { accepted: 0, conflict: 0, rejected: 0, failed: 0 }
+      set({ syncing: true })
+      try {
+        const results = await syncItems(items.map((item) => ({
+          clientItemId: item.id,
+          kind: item.kind,
+          paragraphId: item.paragraphId,
+          baseText: item.payload.baseText,
+          localText: item.payload.localText,
+          localId: item.payload.localId,
+          commentType: item.payload.commentType,
+          quote: item.payload.quote,
+          body: item.payload.body,
+          suggestion: item.payload.suggestion,
+          replyId: item.payload.replyId,
+          commentId: item.payload.commentId,
+          author: item.payload.author,
+          role: item.payload.role,
+          attempts: item.attempts,
+        })))
+        const resultMap = new Map(results.map((result) => [result.clientItemId, result]))
+        const summary: SyncSummary = {
+          accepted: results.filter((result) => result.status === 'accepted').length,
+          conflict: results.filter((result) => result.status === 'conflict').length,
+          rejected: results.filter((result) => result.status === 'rejected').length,
+          failed: results.filter((result) => result.status === 'failed').length,
+        }
+        set((state) => {
+          const queue = state.queue.map((item) => {
+            const result = resultMap.get(item.id)
+            if (!result) return item
+            if (result.status === 'accepted') return { ...item, status: 'succeeded' as const, attempts: item.attempts + 1, lastError: undefined, rejectReason: undefined }
+            if (result.status === 'conflict') return { ...item, status: 'conflict' as const, attempts: item.attempts + 1 }
+            if (result.status === 'rejected') return { ...item, status: 'rejected' as const, attempts: item.attempts + 1, lastError: result.message, rejectReason: result.reason }
+            return { ...item, status: 'failed' as const, attempts: item.attempts + 1, lastError: result.message }
+          })
+
+          // 段落冲突：两边版本都保留，生成待作者选择的冲突卡片
+          const newConflicts: EditConflict[] = results
+            .filter((result) => result.status === 'conflict')
+            .map((result) => {
+              const item = state.queue.find((queued) => queued.id === result.clientItemId) as QueueItem
+              const remoteText = result.status === 'conflict' ? result.remoteText : ''
+              const remoteAuthor = result.status === 'conflict' ? result.remoteAuthor : ''
+              return {
+                id: `conflict-${result.clientItemId}`,
+                paragraphId: item.paragraphId,
+                localText: item.payload.localText ?? '',
+                remoteText,
+                localAuthor: item.payload.author,
+                remoteAuthor,
+                detectedAt: Date.now(),
+                clientItemId: result.clientItemId,
+                baseText: item.payload.baseText,
+              }
+            })
+          const conflicts = [...newConflicts, ...state.conflicts.filter((conflict) => !newConflicts.some((item) => item.id === conflict.id))]
+
+          // 批注/回复的同步状态回写到本地意见上
+          let comments = state.comments
+          for (const item of state.queue) {
+            const result = resultMap.get(item.id)
+            if (!result) continue
+            const syncStatus = result.status === 'accepted' ? undefined : result.status === 'rejected' ? 'rejected' as const : 'failed' as const
+            if (item.kind === 'comment' && item.payload.localId) {
+              comments = comments.map((comment) => comment.id === item.payload.localId ? { ...comment, syncStatus } : comment)
+            } else if (item.kind === 'reply' && item.payload.replyId && item.payload.commentId) {
+              comments = comments.map((comment) => comment.id === item.payload.commentId ? {
+                ...comment,
+                replies: comment.replies.map((reply) => reply.id === item.payload.replyId ? { ...reply, syncStatus } : reply),
+              } : comment)
+            }
+          }
+
+          return { queue, conflicts, comments }
+        })
+        return summary
+      } catch {
+        // 网络整体不可用：队列原样保留，已送的不重送，恢复后只补没成功的
+        set((state) => ({
+          queue: state.queue.map((item) => items.some((queued) => queued.id === item.id)
+            ? { ...item, status: 'failed' as const, lastError: '网络连接中断，队列已保留；恢复后仅重试未成功的条目' }
+            : item),
+        }))
+        return { accepted: 0, conflict: 0, rejected: 0, failed: items.length }
+      } finally {
+        set({ syncing: false })
+      }
+    },
+    retryQueueItem: async (itemId) => {
+      set((state) => ({
+        queue: state.queue.map((item) => item.id === itemId ? { ...item, status: 'pending' as const, lastError: undefined, rejectReason: undefined } : item),
+      }))
+      await get().syncQueue()
+    },
+    rebaseQueueItem: async (itemId) => {
+      set((state) => ({
+        queue: state.queue.map((item) => item.id === itemId ? { ...item, status: 'pending' as const, lastError: undefined, rejectReason: undefined } : item),
+      }))
+      await get().syncQueue()
+    },
+    discardQueueItem: (itemId) => set((state) => {
+      const item = state.queue.find((queued) => queued.id === itemId)
+      const queue = state.queue.filter((queued) => queued.id !== itemId)
+      let comments = state.comments
+      if (item?.kind === 'comment' && item.payload.localId) {
+        comments = comments.map((comment) => comment.id === item.payload.localId ? { ...comment, syncStatus: undefined } : comment)
+      } else if (item?.kind === 'reply' && item.payload.replyId && item.payload.commentId) {
+        comments = comments.map((comment) => comment.id === item.payload.commentId ? {
+          ...comment,
+          replies: comment.replies.map((reply) => reply.id === item.payload.replyId ? { ...reply, syncStatus: undefined } : reply),
+        } : comment)
+      }
+      return { queue, comments }
+    }),
+    clearSucceeded: () => set((state) => ({ queue: state.queue.filter((item) => item.status !== 'succeeded') })),
+    restoreArchive: (archiveId) => {
+      const archive = get().archives.find((item) => item.id === archiveId)
+      if (!archive) return
+      const currentText = get().paragraphs.find((paragraph) => paragraph.id === archive.paragraphId)?.text ?? archive.text
+      record((state) => ({
+        paragraphs: state.paragraphs.map((paragraph) => paragraph.id === archive.paragraphId
+          ? { ...paragraph, text: archive.text, status: 'open' as const, highlighted: true }
+          : paragraph),
+      }))
+      set((state) => ({ archives: state.archives.filter((item) => item.id !== archiveId) }))
+      // 恢复落选版本视为一次新的本地改动，重新进入待提交队列
+      get().enqueueParagraphEdit(archive.paragraphId, currentText, archive.text)
+    },
     undo: () => set((state) => {
       const previous = state.past.at(-1)
       if (!previous) return state
@@ -168,8 +471,31 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     },
     resetDemo: () => {
       localStorage.removeItem(DRAFT_KEY)
-      set({ paragraphs: clone(baseParagraphs), comments: clone(baseComments), versions: clone(initialVersions), conflicts: [], past: [], future: [], dirty: false })
+      localStorage.removeItem(QUEUE_KEY)
+      resetMockServer(baseParagraphs)
+      set({
+        paragraphs: clone(baseParagraphs),
+        comments: clone(baseComments),
+        versions: clone(initialVersions),
+        conflicts: [],
+        queue: [],
+        archives: [],
+        networkOnline: true,
+        syncing: false,
+        failRandom: false,
+        past: [],
+        future: [],
+        dirty: false,
+      })
       persistDraft(baseParagraphs, baseComments, initialVersions)
     },
   }
 })
+
+// 队列与存档独立持久化，断网或刷新后不丢失
+useReviewStore.subscribe((state) => {
+  persistQueue(state.queue, state.archives)
+})
+
+// 远端审阅服务以当前示例段落为种子（p-03 锁定、p-04 已合并、p-06 已被他人改过）
+resetMockServer(baseParagraphs)

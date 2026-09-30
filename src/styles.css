@@ -21,6 +21,12 @@ button, input, textarea { font: inherit; }
 .conflict-content > div { padding: 9px 11px; border: 1px solid #e3ccc9; border-radius: 7px; background: #fffafa; }
 .conflict-content p { margin: 4px 0 0; font-size: 12px; line-height: 1.5; }
 .conflict-content .ant-space { grid-column: 1 / -1; }
+.conflict-base { grid-column: 1 / -1; margin: 2px 0 0; color: #8a7d72; font-size: 11px; }
+.header-actions { flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; }
+.net-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.net-controls .ant-tag { margin-inline-end: 0; }
+.toc-queue-tag { margin-inline-start: auto; font-size: 9px; line-height: 1.4; }
+.toc-section button .ant-badge { justify-self: end; }
 .workspace { height: calc(100vh - 121px); min-height: 680px; display: grid; grid-template-columns: 240px minmax(600px, 1fr) 400px; overflow: hidden; }
 .toc-panel, .comments-panel { overflow: auto; background: rgba(250,248,244,.96); }
 .toc-panel { padding: 18px 13px; border-right: 1px solid #d8d1c8; }
@@ -28,7 +34,7 @@ button, input, textarea { font: inherit; }
 .panel-title { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; color: #4c433c; font-size: 12px; font-weight: 750; text-transform: uppercase; letter-spacing: .04em; }
 .toc-section { margin-bottom: 17px; }
 .toc-section > strong { display: block; margin: 0 8px 5px; color: #8b7d72; font-size: 10px; letter-spacing: .08em; }
-.toc-section button { width: 100%; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto; gap: 4px; align-items: center; padding: 7px 8px; border: 0; border-radius: 6px; color: #655b53; background: transparent; font-size: 11px; text-align: left; cursor: pointer; }
+.toc-section button { width: 100%; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto auto; gap: 4px; align-items: center; padding: 7px 8px; border: 0; border-radius: 6px; color: #655b53; background: transparent; font-size: 11px; text-align: left; cursor: pointer; }
 .toc-section button > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .toc-section button:hover, .toc-section button.active { color: #7b3f2f; background: #eee3d6; }
 .version-box { margin-top: 24px; padding-top: 18px; border-top: 1px solid #ded7cf; }
@@ -112,4 +118,30 @@ kbd { padding: 1px 4px; border: 1px solid #706158; border-radius: 3px; color: #f
   .paper-sheet { padding: 24px 18px 50px; }
   .comments-panel > .keyboard-hint { position: static; width: auto; }
   .conflict-content { grid-template-columns: 1fr; }
+  .net-controls { margin-left: 0; flex-wrap: wrap; }
 }
+
+/* 本地待提交队列 */
+.queue-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 12px; }
+.queue-summary .ant-btn { margin-left: auto; }
+.queue-summary .ant-checkbox { font-size: 11px; }
+.queue-offline { margin-bottom: 12px; }
+.queue-section { margin-bottom: 20px; }
+.queue-section .panel-title { display: flex; align-items: center; gap: 7px; }
+.queue-section .panel-title .ant-btn { margin-left: auto; padding: 0; }
+.queue-item { margin-bottom: 8px; padding: 9px 11px; border: 1px solid #e4ddd4; border-radius: 7px; background: #fffefa; }
+.queue-item.failed { border-color: #e5b8b2; background: #fff7f5; }
+.queue-item.rejected { border-color: #e8c9a8; background: #fff9f2; }
+.queue-item.conflict { border-color: #e3b7a0; background: #fff6f0; }
+.queue-item.succeeded { opacity: .75; }
+.queue-item-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; color: #4c433c; font-size: 12px; }
+.queue-item-head .anticon { color: #7b3f2f; }
+.queue-item-head small { margin-left: auto; color: #a29488;; font-size: 10px; }
+.queue-item-body { margin: 2px 0 6px; color: #5d534b; font-size: 12px; line-height: 1.6; }
+.queue-item-error { margin: 0 0 6px; color: #b04a3f; font-size: 11px; }
+.queue-item-actions { display: flex; gap: 6px; }
+.archive-section { padding-top: 14px; border-top: 1px dashed #d8d1c8; }
+.archive-hint { margin: 0 0 10px; color: #97897c; font-size: 11px; line-height: 1.6; }
+.archive-item { margin-bottom: 8px; padding: 9px 11px; border: 1px dashed #c9b8a3; border-radius: 7px; background: #fbf7f0; }
+.archive-item .queue-item-body { font-family: Georgia, "Songti SC", serif; }
+.reply .ant-tag { margin-left: auto; font-size: 9px; line-height: 1.4; }
