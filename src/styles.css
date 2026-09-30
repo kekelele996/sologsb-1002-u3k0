@@ -113,3 +113,29 @@ kbd { padding: 1px 4px; border: 1px solid #706158; border-radius: 3px; color: #f
   .comments-panel > .keyboard-hint { position: static; width: auto; }
   .conflict-content { grid-template-columns: 1fr; }
 }
+
+/* 联网状态与待提交队列 */
+.online-switch { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; color: #f8f4eb; }
+.online-switch .ant-switch-checked { background: #3f8f6b; }
+.queue-banner-state { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: #6a5f56; cursor: pointer; }
+.queue-banner-state:hover { color: #7b3f2f; }
+.queue-inline-note { margin-top: 6px; padding: 5px 9px; border-radius: 5px; background: #fff4ec; border-left: 3px solid #d4886a; color: #8a4a32; font-size: 10.5px; line-height: 1.5; cursor: pointer; }
+.queue-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.queue-last-sync { margin-left: auto; color: #9c8f84; font-size: 10px; }
+.queue-list { display: grid; gap: 9px; }
+.queue-item { background: #fffefa; border-color: #e2dbd3; }
+.queue-item.queue-conflict { border-left: 3px solid #cf4332; background: #fff7f5; }
+.queue-item.queue-blocked { border-left: 3px solid #8069c0; background: #f7f4fd; }
+.queue-item.queue-failed { border-left: 3px solid #bd5c53; background: #fdf6f5; }
+.queue-item.queue-sending { border-left: 3px solid #5b8fc4; }
+.queue-item.queue-shelf { border-left: 3px solid #d3a95d; background: #fffaef; }
+.queue-item-head { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.queue-item-title { color: #403a35; font-size: 12px; font-weight: 700; }
+.queue-item-body { margin: 5px 0 0; color: #5b524b; font-size: 11.5px; line-height: 1.6; }
+.queue-error { margin-top: 6px; color: #a04738; font-size: 10.5px; line-height: 1.5; }
+.queue-item-actions { margin-top: 8px; display: flex; justify-content: flex-end; }
+.queue-item .ant-card-body { padding: 10px 12px; }
+.server-sim-box { padding: 12px; border: 1px dashed #c8c0b7; border-radius: 8px; background: #faf7f2; }
+.server-sim-box > p { margin: 0 0 9px; color: #7c7168; font-size: 11px; line-height: 1.6; }
+.server-sim-merge { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+.server-sim-hint { margin-top: 9px !important; color: #a29488 !important; }

@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
-  CommentOutlined, DiffOutlined, DeleteOutlined, FileDoneOutlined, FileTextOutlined,
-  HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlusOutlined,
-  RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
+  ApiOutlined, ArrowLeftOutlined, BranchesOutlined, CheckOutlined, ClockCircleOutlined,
+  CloseOutlined, CloudOutlined, CommentOutlined, DiffOutlined, DeleteOutlined, DisconnectOutlined,
+  FileDoneOutlined, FileTextOutlined, HistoryOutlined, InboxOutlined, LockOutlined, MenuFoldOutlined,
+  MessageOutlined, PlusOutlined, RedoOutlined, ReloadOutlined, SaveOutlined, SendOutlined, SwapOutlined,
+  UndoOutlined, UnlockOutlined,
 } from '@ant-design/icons'
-import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
-import { submitRemotePatch } from './services/mockApi'
+import { Alert, Badge, Button, Card, Checkbox, Divider, Drawer, Empty, Input, Modal, Radio, Segmented, Select, Space, Spin, Switch, Tag, Tooltip, message } from 'antd'
 import { useReviewStore } from './store/review'
-import type { Comment, CommentType, Paragraph, Role } from './types'
+import type { Comment, CommentType, QueuedChange, QueueStatus, Role, ShelvedVersion } from './types'
 
 const roleMeta: Record<Role, { label: string; description: string; color: string }> = {
   author: { label: '作者工作区', description: '编辑正文，逐条接受或拒绝修改建议', color: '#2f6f5e' },
@@ -18,12 +18,32 @@ const roleMeta: Record<Role, { label: string; description: string; color: string
 const roleIcon = (role: Role) => role === 'author' ? <FileDoneOutlined /> : role === 'reviewer' ? <CommentOutlined /> : <BranchesOutlined />
 const formatDate = (value: number) => new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
+const statusMeta: Record<QueueStatus, { label: string; color: string }> = {
+  queued: { label: '待提交', color: 'orange' },
+  sending: { label: '同步中', color: 'blue' },
+  failed: { label: '同步失败', color: 'red' },
+  blocked: { label: '已退回', color: 'purple' },
+  conflict: { label: '两边都改了', color: 'volcano' },
+  sent: { label: '已送达', color: 'green' },
+}
+const kindLabel: Record<QueuedChange['kind'], string> = {
+  'paragraph-edit': '段落正文',
+  'paragraph-lock': '段落锁定',
+  'comment-add': '新增批注',
+  'comment-reply': '讨论回复',
+  'comment-merge': '合并意见',
+}
+const ACTIVE_QUEUE: QueueStatus[] = ['queued', 'sending', 'failed', 'blocked', 'conflict']
+
 export default function App() {
   const {
-    role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
+    role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty,
+    online, weakNetwork, syncing, queue, shelf, lastSyncAt, lastError, serverRefs,
     setRole, selectParagraph, setCommentFilter, setRevisionMode, updateParagraph, addComment, replyComment,
-    resolveSuggestion, mergeComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
-    undo, redo, save, resetDemo,
+    resolveSuggestion, mergeComment, toggleLock, createVersion, undo, redo, save, resetDemo,
+    setOnline, setWeakNetworkMode, syncNow, resolveQueueConflict, retryQueuedChange, removeQueuedChange,
+    clearSentQueue, restoreShelfVersion, removeShelfVersion,
+    simulateRemoteParagraphEdit, simulateRemoteParagraphLock, simulateRemoteCommentMerge,
   } = useReviewStore()
   const [composerOpen, setComposerOpen] = useState(false)
   const [commentType, setCommentType] = useState<CommentType>('comment')
@@ -35,6 +55,9 @@ export default function App() {
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
   const [versionB, setVersionB] = useState(versions[0]?.id)
   const [versionLabel, setVersionLabel] = useState('')
+  const [queueOpen, setQueueOpen] = useState(false)
+  const [simMergeCommentId, setSimMergeCommentId] = useState<string | undefined>()
+  const autoSyncTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const selected = paragraphs.find((paragraph) => paragraph.id === selectedParagraphId) ?? paragraphs[0]
   const sections = useMemo(() => Array.from(new Set(paragraphs.map((paragraph) => paragraph.section))), [paragraphs])
@@ -49,6 +72,40 @@ export default function App() {
     if (commentFilter === 'duplicate') return duplicateParagraphIds.has(comment.paragraphId) && comment.status === 'open'
     return true
   }).sort((a, b) => b.createdAt - a.createdAt), [commentFilter, comments, duplicateParagraphIds])
+
+  const paragraphQueue = useMemo(() => {
+    const map: Record<string, QueuedChange> = {}
+    for (const item of queue) {
+      if (item.kind !== 'paragraph-edit' || !ACTIVE_QUEUE.includes(item.status) || !item.paragraphId) continue
+      if (!map[item.paragraphId] || item.updatedAt > map[item.paragraphId].updatedAt) map[item.paragraphId] = item
+    }
+    return map
+  }, [queue])
+  const commentQueue = useMemo(() => {
+    const map: Record<string, QueuedChange> = {}
+    for (const item of queue) {
+      if ((item.kind !== 'comment-add' && item.kind !== 'comment-reply' && item.kind !== 'comment-merge') || !ACTIVE_QUEUE.includes(item.status)) continue
+      const key = item.kind === 'comment-add' ? item.id : item.commentId
+      if (!key) continue
+      if (!map[key] || item.updatedAt > map[key].updatedAt) map[key] = item
+    }
+    return map
+  }, [queue])
+  const conflictItems = useMemo(() => queue.filter((item) => item.status === 'conflict'), [queue])
+  const pendingCount = queue.filter((item) => ACTIVE_QUEUE.includes(item.status)).length
+  const failedCount = queue.filter((item) => item.status === 'failed' || item.status === 'blocked').length
+  const sentItems = queue.filter((item) => item.status === 'sent')
+
+  // 有新的待提交条目且在线时，自动延迟对账；失败的重试只补没送成功的
+  const queueSignature = queue.map((item) => `${item.id}:${item.status}`).join('|')
+  useEffect(() => {
+    if (!online) return
+    const hasFresh = queue.some((item) => item.status === 'queued')
+    if (!hasFresh) return
+    if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current)
+    autoSyncTimer.current = setTimeout(() => { void syncNow(true) }, 900)
+    return () => { if (autoSyncTimer.current) clearTimeout(autoSyncTimer.current) }
+  }, [queueSignature, online, syncNow])
 
   useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -100,16 +157,17 @@ export default function App() {
     if (!selected || !commentBody.trim()) { message.warning('请填写批注内容'); return }
     addComment({ paragraphId: selected.id, type: commentType, quote, body: commentBody.trim(), suggestion: commentType === 'suggestion' ? suggestion : undefined })
     setCommentBody(''); setSuggestion(''); setQuote(''); setComposerOpen(false)
-    message.success(commentType === 'suggestion' ? '修改建议已提交' : '段落批注已添加')
+    message.success(online ? '批注已进入同步队列并自动提交' : '当前断网，批注已攒入本地待提交队列')
   }
-  const handleMockConflict = async () => {
-    if (!selected) return
-    const response = await submitRemotePatch(selected)
-    addConflict({
-      id: `conflict-${Date.now()}`, paragraphId: selected.id, localText: selected.text, remoteText: response.remoteText,
-      localAuthor: roleMeta[role].label, remoteAuthor: response.remoteAuthor, detectedAt: Date.now(),
-    })
-    message.warning('模拟接口返回了同段落的远端修改，请处理冲突')
+  const handleManualSync = async () => {
+    if (!online) { message.warning('当前断网，改动先留在本地队列，网络恢复后自动对账'); return }
+    const result = await syncNow(false)
+    if (!result) return
+    if (result.sent) message.success(`已对账 ${result.sent} 条改动${result.pulled ? `，拉取 ${result.pulled} 处远端更新` : ''}`)
+    if (result.conflicts) message.warning(`${result.conflicts} 个段落两边都改过，请挑选保留版本`)
+    if (result.blocked) message.warning(`${result.blocked} 条改动被服务端退回（锁定或意见已合并）`)
+    if (result.failed) message.error(`${result.failed} 条未送达，已留在队列，重试时只补这些`)
+    if (!result.sent && !result.conflicts && !result.blocked && !result.failed) message.info('没有待提交的改动')
   }
   const handleCreateVersion = () => {
     if (versionLabel.trim()) createVersion(versionLabel.trim())
@@ -120,6 +178,62 @@ export default function App() {
   const comparedA = versions.find((version) => version.id === versionA)
   const comparedB = versions.find((version) => version.id === versionB)
   const comparedRows = comparedA && comparedB ? comparedA.paragraphs.map((paragraph, index) => ({ a: paragraph, b: comparedB.paragraphs[index] })) : []
+
+  const describeQueueItem = (item: QueuedChange) => {
+    const paragraph = item.paragraphId ? paragraphs.find((p) => p.id === item.paragraphId) : undefined
+    if (item.kind === 'paragraph-edit') return { title: `段落 ${paragraph?.number ?? ''} 正文修改`, body: item.text }
+    if (item.kind === 'paragraph-lock') return { title: `段落 ${paragraph?.number ?? ''} ${item.locked ? '锁定' : '解锁'}`, body: undefined }
+    if (item.kind === 'comment-add') {
+      const target = comments.find((comment) => comment.id === item.id)
+      return { title: `新增${item.comment?.type === 'suggestion' ? '修改建议' : '段落批注'}`, body: item.comment?.body ?? target?.body }
+    }
+    if (item.kind === 'comment-reply') {
+      const target = comments.find((comment) => comment.id === item.commentId)
+      return { title: `回复“${target?.author ?? '批注'}”的意见`, body: item.reply?.body }
+    }
+    const target = comments.find((comment) => comment.id === item.commentId)
+    const mergeTarget = comments.find((comment) => comment.id === item.targetCommentId)
+    return { title: `把“${target?.author ?? '该意见'}”的意见合并到“${mergeTarget?.author ?? '另一意见'}”`, body: undefined }
+  }
+
+  const renderQueueActions = (item: QueuedChange) => {
+    if (item.status === 'sending') return <Spin size="small" />
+    if (item.status === 'conflict') {
+      return role === 'author'
+        ? <Space size={4} wrap>
+            <Button size="small" onClick={() => resolveQueueConflict(item.id, 'local')}>保留本页</Button>
+            <Button size="small" type="primary" onClick={() => resolveQueueConflict(item.id, 'remote')}>采用远端</Button>
+          </Space>
+        : <Tag>等待作者挑版本</Tag>
+    }
+    if (item.status === 'blocked') {
+      return <Space size={4}>
+        <Button size="small" icon={<ReloadOutlined />} onClick={() => retryQueuedChange(item.id)}>重新提交</Button>
+        <Tooltip title="放弃这条改动（落选正文可随后从存档找回）"><Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => removeQueuedChange(item.id)} /></Tooltip>
+      </Space>
+    }
+    if (item.status === 'failed') {
+      return <Space size={4}>
+        <Button size="small" type="primary" icon={<ReloadOutlined />} onClick={() => retryQueuedChange(item.id)}>重试</Button>
+        <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => removeQueuedChange(item.id)} />
+      </Space>
+    }
+    if (item.status === 'queued') {
+      return <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => removeQueuedChange(item.id)} />
+    }
+    return <small style={{ color: '#8a8178' }}>{formatDate(item.updatedAt)}</small>
+  }
+
+  const renderShelfActions = (item: ShelvedVersion) => (
+    <Space size={4}>
+      <Button size="small" type="primary" icon={<SwapOutlined />} onClick={() => { restoreShelfVersion(item.id); message.success('落选版本已找回并重新排队') }}>找回这版</Button>
+      <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => removeShelfVersion(item.id)} />
+    </Space>
+  )
+
+  const simMergeOptions = comments
+    .filter((comment) => comment.paragraphId === selected?.id && comment.status === 'open')
+    .map((comment) => ({ label: `${comment.author} · ${comment.body.slice(0, 14)}…`, value: comment.id }))
 
   return (
     <div className="review-app">
@@ -132,33 +246,73 @@ export default function App() {
           <Segmented block value={role} onChange={(value) => setRole(value as Role)} options={(Object.keys(roleMeta) as Role[]).map((item) => ({ label: <span>{roleIcon(item)} {roleMeta[item].label.replace('工作区', '')}</span>, value: item }))} />
         </div>
         <Space>
+          <Tooltip title={online ? '联网中：改动自动与审阅服务对账' : '断网中：改动攒在本地队列，恢复后自动同步'}>
+            <span className="online-switch">
+              {online ? <CloudOutlined /> : <DisconnectOutlined />}
+              <Switch checked={online} checkedChildren="联网" unCheckedChildren="断网" onChange={setOnline} />
+            </span>
+          </Tooltip>
+          <Badge count={pendingCount} size="small">
+            <Button icon={<InboxOutlined />} danger={failedCount > 0} onClick={() => setQueueOpen(true)}>
+              待提交队列
+            </Button>
+          </Badge>
+          <Tooltip title="只补没送成功的段落，已送达的不会重发">
+            <Button type="primary" ghost icon={<ReloadOutlined spin={syncing} />} loading={syncing} onClick={() => void handleManualSync()}>同步</Button>
+          </Tooltip>
           <Badge dot={dirty}><Button icon={<SaveOutlined />} onClick={() => { save(); message.success('草稿已保存到浏览器') }}>保存</Button></Badge>
           <Button icon={<UndoOutlined />} disabled={!useReviewStore.getState().past.length} onClick={undo} />
           <Button icon={<RedoOutlined />} disabled={!useReviewStore.getState().future.length} onClick={redo} />
-          <Button danger={conflicts.length > 0} icon={<SwapOutlined />} onClick={() => void handleMockConflict()}>模拟冲突</Button>
         </Space>
       </header>
 
       <div className="role-banner" style={{ '--role-color': roleMeta[role].color } as React.CSSProperties}>
         <span className="role-badge">{roleIcon(role)} {roleMeta[role].label}</span>
         <span>{roleMeta[role].description}</span>
+        <span className="queue-banner-state" onClick={() => setQueueOpen(true)}>
+          {online ? <CloudOutlined /> : <DisconnectOutlined />}
+          {online ? (syncing ? '正在逐段对账…' : `在线 · 上次对账 ${lastSyncAt ? formatDate(lastSyncAt) : '尚未'}`) : '离线编辑中，改动已进入本地队列'}
+          {!!pendingCount && <Tag color={failedCount ? 'red' : 'orange'} style={{ marginLeft: 6 }}>{pendingCount} 条待提交</Tag>}
+        </span>
         <span className="paper-state"><FileTextOutlined /> 论文正文 v2.4</span>
       </div>
 
-      {conflicts.length > 0 && (
-        <div className="conflict-stack">
-          {conflicts.map((conflict) => (
+      {conflictItems.map((item) => {
+        const paragraph = item.paragraphId ? paragraphs.find((p) => p.id === item.paragraphId) : undefined
+        return (
+          <div className="conflict-stack" key={item.id}>
             <Alert
-              key={conflict.id} type="error" showIcon message={`段落冲突：${conflict.localAuthor} 与 ${conflict.remoteAuthor} 同时修改`}
+              type="error" showIcon
+              message={`段落 ${paragraph?.number ?? ''} 两边都改过：${item.author} 与 ${item.remoteAuthor} 同时修改`}
               description={(
                 <div className="conflict-content">
-                  <div><b>本页版本</b><p>{conflict.localText}</p></div>
-                  <div><b>模拟远端版本</b><p>{conflict.remoteText}</p></div>
-                  <Space><Button size="small" onClick={() => resolveConflict(conflict.id, 'local')}>保留本页</Button><Button size="small" type="primary" onClick={() => resolveConflict(conflict.id, 'remote')}>采用远端</Button><Button size="small" type="text" onClick={() => dismissConflict(conflict.id)}>稍后处理</Button></Space>
+                  <div><b>本页版本</b><p>{item.text}</p></div>
+                  <div><b>远端版本（修订 {item.remoteRevision}）</b><p>{item.remoteText}</p></div>
+                  <Space>
+                    {role === 'author'
+                      ? <>
+                        <Button size="small" type="primary" onClick={() => resolveQueueConflict(item.id, 'local')}>保留本页</Button>
+                        <Button size="small" onClick={() => resolveQueueConflict(item.id, 'remote')}>采用远端</Button>
+                      </>
+                      : <Tag>请切换到作者工作区挑选版本</Tag>}
+                    <Button size="small" type="text" onClick={() => setQueueOpen(true)}>在队列中查看</Button>
+                  </Space>
                 </div>
               )}
             />
-          ))}
+          </div>
+        )
+      })}
+
+      {!online && (
+        <div className="conflict-stack">
+          <Alert type="warning" showIcon message="当前处于断网状态，段落、批注和回复都攒在本地待提交队列；网络恢复后将逐段与审阅服务对账合并。" />
+        </div>
+      )}
+      {online && lastError && !syncing && (
+        <div className="conflict-stack">
+          <Alert type="error" showIcon message={`上次同步有未送达的改动：${lastError}。队列保留原样，可点“同步”只补失败的段落。`}
+            action={<Button size="small" onClick={() => void handleManualSync()}>立即重试</Button>} />
         </div>
       )}
 
@@ -202,36 +356,47 @@ export default function App() {
             {sections.map((section) => (
               <section key={section} className="paper-section">
                 <h3>{section}</h3>
-                {paragraphs.filter((paragraph) => paragraph.section === section).map((paragraph) => (
-                  <article
-                    id={`paragraph-${paragraph.id}`} key={paragraph.id} onMouseUp={() => setQuote(window.getSelection()?.toString().trim() ?? '')}
-                    className={`paragraph-card ${paragraph.id === selected?.id ? 'selected' : ''} ${paragraph.highlighted ? 'highlighted' : ''} ${paragraph.status === 'locked' ? 'locked' : ''}`}
-                    onClick={() => selectParagraph(paragraph.id)}
-                  >
-                    <div className="paragraph-meta">
-                      <span className="paragraph-no">{paragraph.number}</span>
-                      <span>段落 {paragraph.number.replace('.', '')}</span>
-                      {paragraph.status === 'locked' && <Tag icon={<LockOutlined />} color="purple">已锁定</Tag>}
-                      {paragraph.status === 'accepted' && <Tag icon={<CheckOutlined />} color="green">已确认</Tag>}
-                      {!!paragraphCommentCounts[paragraph.id] && <Tag icon={<MessageOutlined />}>{paragraphCommentCounts[paragraph.id]} 条意见</Tag>}
-                    </div>
-                    {revisionMode ? (
-                      <div className="revision-grid">
-                        <div><small>原稿</small><p>{paragraph.original}</p></div>
-                        <div><small>当前修订</small><p>{paragraph.text}</p></div>
+                {paragraphs.filter((paragraph) => paragraph.section === section).map((paragraph) => {
+                  const queued = paragraphQueue[paragraph.id]
+                  return (
+                    <article
+                      id={`paragraph-${paragraph.id}`} key={paragraph.id} onMouseUp={() => setQuote(window.getSelection()?.toString().trim() ?? '')}
+                      className={`paragraph-card ${paragraph.id === selected?.id ? 'selected' : ''} ${paragraph.highlighted ? 'highlighted' : ''} ${paragraph.status === 'locked' ? 'locked' : ''}`}
+                      onClick={() => selectParagraph(paragraph.id)}
+                    >
+                      <div className="paragraph-meta">
+                        <span className="paragraph-no">{paragraph.number}</span>
+                        <span>段落 {paragraph.number.replace('.', '')}</span>
+                        {paragraph.status === 'locked' && <Tag icon={<LockOutlined />} color="purple">已锁定</Tag>}
+                        {paragraph.status === 'accepted' && <Tag icon={<CheckOutlined />} color="green">已确认</Tag>}
+                        {!!paragraphCommentCounts[paragraph.id] && <Tag icon={<MessageOutlined />}>{paragraphCommentCounts[paragraph.id]} 条意见</Tag>}
+                        {queued && <Tag color={statusMeta[queued.status].color} icon={<ClockCircleOutlined />} onClick={(event) => { event.stopPropagation(); setQueueOpen(true) }}>{statusMeta[queued.status].label}</Tag>}
                       </div>
-                    ) : role === 'author' ? (
-                      <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked'} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
-                    ) : (
-                      <p className="paragraph-text">{paragraph.text}</p>
-                    )}
-                    <div className="paragraph-actions">
-                      {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
-                      {role === 'editor' && <Button size="small" icon={paragraph.status === 'locked' ? <UnlockOutlined /> : <LockOutlined />} onClick={(event) => { event.stopPropagation(); toggleLock(paragraph.id) }}>{paragraph.status === 'locked' ? '解除锁定' : '锁定段落'}</Button>}
-                      {role === 'author' && <span className="author-tip">可直接修改正文，右侧逐条处理建议</span>}
-                    </div>
-                  </article>
-                ))}
+                      {revisionMode ? (
+                        <div className="revision-grid">
+                          <div><small>原稿</small><p>{paragraph.original}</p></div>
+                          <div><small>当前修订</small><p>{paragraph.text}</p></div>
+                        </div>
+                      ) : role === 'author' ? (
+                        <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked'} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
+                      ) : (
+                        <p className="paragraph-text">{paragraph.text}</p>
+                      )}
+                      {queued && (queued.status === 'blocked' || queued.status === 'failed' || queued.status === 'conflict') && (
+                        <div className="queue-inline-note" onClick={() => setQueueOpen(true)}>
+                          {queued.status === 'blocked' && `服务端退回：${queued.blockDetail ?? '段落可能已被编辑锁定'}，改动仍在队列里`}
+                          {queued.status === 'failed' && `未送达：${queued.lastError ?? '网络异常'}，恢复后只补这一段`}
+                          {queued.status === 'conflict' && '远端也改了这一段，需要作者挑选保留哪一版（落选版本可找回）'}
+                        </div>
+                      )}
+                      <div className="paragraph-actions">
+                        {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
+                        {role === 'editor' && <Button size="small" icon={paragraph.status === 'locked' ? <UnlockOutlined /> : <LockOutlined />} onClick={(event) => { event.stopPropagation(); toggleLock(paragraph.id) }}>{paragraph.status === 'locked' ? '解除锁定' : '锁定段落'}</Button>}
+                        {role === 'author' && <span className="author-tip">可直接修改正文，右侧逐条处理建议；改动先进本地队列，联网后对账</span>}
+                      </div>
+                    </article>
+                  )
+                })}
               </section>
             ))}
           </div>
@@ -249,11 +414,17 @@ export default function App() {
           <div className="comment-list">
             {visibleComments.map((comment) => {
               const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+              const queued = commentQueue[comment.id]
               return (
-                <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
+                <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag>{queued && <Tag color={statusMeta[queued.status].color}>{statusMeta[queued.status].label}</Tag>}</span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
                   <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
                   <p className="comment-body">{comment.body}</p>
                   {comment.suggestion && <div className="suggestion-box"><small>建议改为</small><p>{comment.suggestion}</p></div>}
+                  {queued && (queued.status === 'blocked' || queued.status === 'failed') && (
+                    <div className="queue-inline-note" onClick={() => setQueueOpen(true)}>
+                      {queued.status === 'blocked' ? `服务端退回：${queued.blockDetail}` : `未送达：${queued.lastError}`}
+                    </div>
+                  )}
                   {comment.status !== 'open' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : 'blue'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : '已合并'}</Tag>}
                   <div className="replies">
                     {comment.replies.map((reply) => <div key={reply.id} className="reply"><b>{reply.author}</b><span>{reply.body}</span></div>)}
@@ -276,6 +447,104 @@ export default function App() {
         </aside>
       </main>
 
+      <Drawer
+        title={<Space><InboxOutlined /> 本地待提交队列</Space>}
+        width={560} open={queueOpen} onClose={() => setQueueOpen(false)}
+        extra={<Space>
+          <Checkbox checked={weakNetwork} onChange={(event) => setWeakNetworkMode(event.target.checked)}>模拟弱网（每 3 次请求失败 1 次）</Checkbox>
+          {!!sentItems.length && <Button size="small" onClick={clearSentQueue}>清空已送达（{sentItems.length}）</Button>}
+        </Space>}
+      >
+        <Alert
+          type={online ? 'info' : 'warning'} showIcon
+          message={online ? '在线模式：改动自动逐段与审阅服务对账，失败的段落留在队列里，只补没送成功的。' : '离线模式：段落、批注和回复先攒在本队列，网络恢复后逐段对账合并。'}
+          style={{ marginBottom: 12 }}
+        />
+        <div className="queue-summary">
+          <Tag color="orange">{queue.filter((item) => item.status === 'queued').length} 待提交</Tag>
+          <Tag color="blue">{queue.filter((item) => item.status === 'sending').length} 同步中</Tag>
+          <Tag color="red">{queue.filter((item) => item.status === 'failed').length} 失败</Tag>
+          <Tag color="purple">{queue.filter((item) => item.status === 'blocked').length} 被退回</Tag>
+          <Tag color="volcano">{conflictItems.length} 冲突</Tag>
+          <Tag color="green">{sentItems.length} 已送达</Tag>
+          <span className="queue-last-sync"><ClockCircleOutlined /> 上次对账：{lastSyncAt ? formatDate(lastSyncAt) : '尚未'}</span>
+        </div>
+
+        <Divider orientation="left" plain>待处理改动</Divider>
+        <div className="queue-list">
+          {queue.filter((item) => ACTIVE_QUEUE.includes(item.status)).length === 0 && (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={online ? '队列是空的，所有改动都已送达审阅服务' : '离线后这里会按段落攒住全部改动'} />
+          )}
+          {queue.filter((item) => ACTIVE_QUEUE.includes(item.status)).map((item) => {
+            const description = describeQueueItem(item)
+            return (
+              <Card key={item.id} size="small" className={`queue-item queue-${item.status}`}>
+                <div className="queue-item-head">
+                  <Space size={4} wrap><Tag color="geekblue">{kindLabel[item.kind]}</Tag><Tag color={statusMeta[item.status].color}>{statusMeta[item.status].label}</Tag><small>{item.author} · {formatDate(item.createdAt)}</small></Space>
+                </div>
+                <div className="queue-item-title">{description.title}</div>
+                {description.body && item.kind === 'paragraph-edit' && item.status === 'conflict' && (
+                  <div className="conflict-content">
+                    <div><b>本页版本</b><p>{item.text}</p></div>
+                    <div><b>远端版本</b><p>{item.remoteText}</p></div>
+                  </div>
+                )}
+                {description.body && item.status !== 'conflict' && <p className="queue-item-body">{description.body}</p>}
+                {item.status === 'failed' && <div className="queue-error">未送达：{item.lastError}（已尝试 {item.attempts} 次）</div>}
+                {item.status === 'blocked' && <div className="queue-error">服务端退回：{item.blockDetail ?? '远端状态已变化'}。改动保留在队列中，处理后可重新提交。</div>}
+                <div className="queue-item-actions">{renderQueueActions(item)}</div>
+              </Card>
+            )
+          })}
+        </div>
+
+        <Divider orientation="left" plain>落选版本存档（{shelf.length}）</Divider>
+        <div className="queue-list">
+          {!shelf.length && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="挑版本时落选的本页/远端版本会存到这里，随时可以找回" />}
+          {shelf.map((item) => (
+            <Card key={item.id} size="small" className="queue-item queue-shelf">
+              <div className="queue-item-head">
+                <Space size={4} wrap>
+                  <Tag color={item.source === 'local' ? 'gold' : 'cyan'}>{item.source === 'local' ? '落选的本页版本' : '落选的远端版本'}</Tag>
+                  <small>段落 {item.paragraphNumber} · {item.author}</small>
+                </Space>
+              </div>
+              <p className="queue-item-body">{item.text}</p>
+              <div className="queue-item-actions">{renderShelfActions(item)}</div>
+            </Card>
+          ))}
+        </div>
+
+        <Divider orientation="left" plain><Space><ApiOutlined /> 审阅服务模拟（别人在服务端的动作）</Space></Divider>
+        <div className="server-sim-box">
+          <p>选中段落后，模拟协作者在服务端直接改动；先断网改本地，再让远端改动，恢复网络即可看到逐段对账。</p>
+          <Space wrap>
+            <Button size="small" icon={<EditOutlinedAlt />} disabled={!selected} onClick={() => {
+              if (!selected) return
+              const text = simulateRemoteParagraphEdit(selected.id)
+              if (text) message.info(`远端协作者修改了段落 ${selected.number}`)
+            }}>远端修改当前段落</Button>
+            <Button size="small" icon={<LockOutlined />} disabled={!selected} onClick={() => { simulateRemoteParagraphLock(selected.id, true); message.info('远端编辑已锁定该段落') }}>远端锁定当前段落</Button>
+            <Button size="small" icon={<UnlockOutlined />} disabled={!selected} onClick={() => { simulateRemoteParagraphLock(selected.id, false); message.info('远端编辑已解锁该段落') }}>远端解锁</Button>
+          </Space>
+          <div className="server-sim-merge">
+            <Select size="small" placeholder="选择当前段落的一条意见" value={simMergeCommentId} onChange={setSimMergeCommentId}
+              options={simMergeOptions} style={{ minWidth: 260 }} />
+            <Button size="small" icon={<BranchesOutlined />} disabled={!simMergeCommentId} onClick={() => {
+              if (!simMergeCommentId) return
+              const target = comments.find((comment) => comment.id !== simMergeCommentId && comment.paragraphId === selected?.id)
+              if (!target) { message.warning('当前段落没有可合并到的另一条意见'); return }
+              simulateRemoteCommentMerge(simMergeCommentId, target.id)
+              message.info('远端编辑已合并该意见，相关回复将被退回队列')
+            }}>远端合并这条意见</Button>
+          </div>
+          <p className="server-sim-hint">服务端段落修订：{selected ? `段落 ${selected.number} = r${serverRefs.paragraphs[selected.id]?.revision ?? 1}` : '—'}</p>
+        </div>
+
+        <Divider />
+        <Button block danger type="dashed" size="small" icon={<DeleteOutlined />} onClick={() => { resetDemo(); message.success('已重置示例数据（含服务端与队列）') }}>重置全部示例数据</Button>
+      </Drawer>
+
       <Modal title={commentType === 'suggestion' ? '提出修改建议' : '添加段落批注'} open={composerOpen} onCancel={() => setComposerOpen(false)} onOk={submitComment} okText="提交" width={620}>
         <div className="composer">
           <label>引用原文</label>
@@ -290,7 +559,7 @@ export default function App() {
       <Modal title="版本比较" open={versionOpen} onCancel={() => setVersionOpen(false)} footer={null} width={980}>
         <div className="compare-selectors">
           <Select value={versionA} onChange={setVersionA} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}`, value: version.id }))} />
-          <ArrowRightOutlined />
+          <ArrowLeftOutlined />
           <Select value={versionB} onChange={setVersionB} options={versions.map((version) => ({ label: `${version.label} · ${formatDate(version.createdAt)}`, value: version.id }))} />
         </div>
         <div className="version-table">
@@ -304,9 +573,14 @@ export default function App() {
       </Modal>
 
       <footer className="app-footer">
-        <span>本地草稿自动持久化 · 模拟接口用于演示多人修改后的冲突处理</span>
+        <span>本地草稿与待提交队列自动持久化 · 断网可继续编辑，恢复后逐段对账合并，落选版本可找回</span>
         <Button type="text" size="small" icon={<DeleteOutlined />} onClick={() => { resetDemo(); message.success('已重置示例数据') }}>重置示例</Button>
       </footer>
     </div>
   )
+}
+
+/** 用图标表达“远端在编辑”，避免和顶部模拟按钮混淆 */
+function EditOutlinedAlt() {
+  return <span style={{ fontFamily: 'Georgia, serif', fontStyle: 'italic', fontWeight: 700 }}>远</span>
 }
